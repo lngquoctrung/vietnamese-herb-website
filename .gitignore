@@ -1,6 +1,7 @@
 .venv/
 .git/
 data/
+**/__pycache__
 
 .env
 Website tra cứu thuốc ĐÔNG Y.docx
