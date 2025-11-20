@@ -3,7 +3,7 @@ import sys
 import os
 from pathlib import Path
 
-def get_logger(name: str, filepath: str = None, level=logging.INFO):
+def get_logger(name: str, filepath: str = None, level=logging.INFO) -> logging.Logger:
     logger = logging.getLogger(name=name)
 
     if logger.handlers:
@@ -35,16 +35,17 @@ def get_logger(name: str, filepath: str = None, level=logging.INFO):
     logger.propagate = False
     return logger
 
-def safe_path(path):
-    root_path = Path(__file__).resolve().parent.parent
-    relative_path = os.path.relpath(path, root_path)
-    relative_parts = list(Path(relative_path).parts)
-
-    if ".." in relative_parts:
-        dot_idx = len(relative_parts) - 1 - relative_parts[::-1].index("..")
-        return "/".join(relative_parts[dot_idx:])
-
-    return "/".join(relative_parts)
+def safe_path(path: str) -> str:
+    try:
+        rootpath = Path(__file__).resolve().parent.parent
+        fullpath = Path(path).resolve()
+        try:
+            relativepath = fullpath.relative_to(rootpath)
+            return str(relativepath)
+        except ValueError:
+            return fullpath.name
+    except Exception:
+        return Path(path).name
 
 def validate_json_structure(data: dict) -> dict:
     if not isinstance(data, dict):

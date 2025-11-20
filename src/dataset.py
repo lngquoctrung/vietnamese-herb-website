@@ -1,12 +1,16 @@
 import os
-import re
+import random
 import json
 import time
+import hashlib
+import pandas as pd
+
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-import pandas as pd
-from google import genai
 from google.genai import types
+from google import genai
+from pypdf import PdfReader, PdfWriter
 from .utils import get_logger, safe_path, validate_json_structure
 
 EXTRACTION_PROMPT = """
@@ -83,18 +87,69 @@ VĂN BẢN:
 """
 
 class DataExtractor:
-    def __init__(self, config, logger_name=__name__, logger_path=None):
-        self.config = config
-        self.gemini_client = genai.Client(api_key=self.config.GEMINI_API_KEY)
-        self.logger = get_logger(name=logger_name, filepath=logger_path)
+    def __init__(self, settings, logger_name: str = __name__, logger_path: str = None):
+        self.settings = settings
+        self.gemini_client = genai.Client(api_key=self.settings.GEMINI_API_KEY)
+        self.logger = get_logger(logger_name, logger_path)
         self.successful_chunks = 0
         self.failed_chunks = 0
+        self.seen_hashes = set()
+
+    def _split_pdf_file(self, input_path: str, output_dir: str, 
+                        pages_per_chunk: int = 400, overlap_pages: int = 50) -> list:
+        # Read pdf file
+        reader = PdfReader(input_path)
+        total_pages = len(reader.pages)
+
+        # Create folder to store splitted pdf file
+        os.makedirs(output_dir, exist_ok=True)
+        output_files = []
+
+        # Calculate step to have overlap
+        step = pages_per_chunk - overlap_pages
+
+        chunk_num = 0
+        start_idx = 0
+        while start_idx < total_pages:
+            writer = PdfWriter()
+            end_idx = min(start_idx + pages_per_chunk, total_pages)
+
+            # Add pages to chunk
+            for page_num in range(start_idx, end_idx):
+                writer.add_page(reader.pages[page_num])
+
+            # Filename and start-end pages information
+            output_filename = f"chunk_{chunk_num:03d}_pages_{start_idx+1:04d}-{end_idx:04d}.pdf"
+            output_path = os.path.join(output_dir, output_filename)
+
+            # Write to pdf file
+            with open(output_path, "wb") as output_file:
+                writer.write(output_file)
+            
+            output_files.append(output_path)
+            self.logger.info(f"Created: {output_filename} ({end_idx - start_idx} pages)")
+
+            chunk_num += 1
+            start_idx += step
+
+            # If the last chunk is too small, merge with previous chunk
+            if start_idx < total_pages and (total_pages - start_idx) < overlap_pages:
+                self.logger.info(f"Merging last {total_pages - start_idx} pages into previous chunk")
+                break
+    
+        self.logger.info(f"Total chunks: {len(output_files)}")
+        self.logger.info(f"Total pages: {total_pages}")
+        self.logger.info(f"Overlap: {overlap_pages} pages between chunks")
+        
+        return output_files
 
     def _upload_and_wait(self, pdf_path: str, timeout: int = 300) -> Any:
         self.logger.info(f"Uploading PDF: {safe_path(pdf_path)}")
+        # Upload pdf file to caching of Gemini
         uploaded_file = self.gemini_client.files.upload(file=pdf_path)
         self.logger.info(f"File uploaded successfully: {uploaded_file.name}")
         
+        # Waiting for file to be uploaded
         start_time = time.time()
         while hasattr(uploaded_file, 'state') and uploaded_file.state == 'PROCESSING':
             if time.time() - start_time > timeout:
@@ -104,163 +159,285 @@ class DataExtractor:
         
         return uploaded_file
 
-    def _chunk_pdf_pages(self, uploaded_file: Any, pages_per_chunk: int = 6, overlap_pages: int = 2) -> List[Dict[str, Any]]:
-        self.logger.info(f"Processing PDF with {pages_per_chunk} pages/chunk, {overlap_pages} pages overlap...")
+    def _calculate_content_hash(self, content: str) -> str:
+        normalized = content.lower().strip()
+        return hashlib.md5(normalized.encode('utf-8')).hexdigest()
+    
+    def _calculate_similarity(self, text1: str, text2: str) -> float:
+        return SequenceMatcher(None, text1.lower(), text2.lower()).ratio()
+    
+    def _is_duplicate(self, herb: Dict[str, Any], existing_herbs: List[Dict[str, Any]]) -> bool:
+        name = herb.get('ten_viet_nam', '').strip()
+        scientific_name = herb.get('ten_khoa_hoc', '').strip()
+        
+        if not name or not scientific_name:
+            return True  # Invalid entry
+        
+        # Check exact match first
+        for existing in existing_herbs:
+            existing_name = existing.get('ten_viet_nam', '').strip()
+            existing_sci = existing.get('ten_khoa_hoc', '').strip()
+            
+            if name.lower() == existing_name.lower():
+                return True
+            
+            # Check scientific name match
+            if scientific_name and existing_sci and scientific_name.lower() == existing_sci.lower():
+                return True
+            
+            # Check fuzzy similarity if enabled
+            if self.settings.USE_FUZZY_MATCHING:
+                name_sim = self._calculate_similarity(name, existing_name)
+                if name_sim >= self.settings.SIMILARITY_THRESHOLD:
+                    self.logger.debug(f"Fuzzy duplicate: '{name}' ~ '{existing_name}' ({name_sim:.2f})")
+                    return True
+        
+        return False
+    
+    def _merge_duplicate_herbs(self, herb1: Dict[str, Any], herb2: Dict[str, Any]) -> Dict[str, Any]:
+        merged = herb1.copy()
+        
+        for key, value in herb2.items():
+            # Skip if current value is placeholder
+            if value and value != "Không có thông tin":
+                existing = merged.get(key, "")
+                # Replace if existing is empty or placeholder
+                if not existing or existing == "Không có thông tin":
+                    merged[key] = value
+                # Merge if both have content and different
+                elif existing != value and len(value) > len(existing):
+                    merged[key] = value
+        
+        return merged
+
+    def _chunk_pdf_pages(self, uploaded_file: Any, total_pages: int, 
+                        process_pages_per_request: int = 8, 
+                        process_overlap_pages: int = 3) -> List[Dict[str, Any]]:
+        self.logger.info(f"Processing PDF: {total_pages} pages, "
+                        f"{process_pages_per_request} pages/chunk, "
+                        f"{process_overlap_pages} overlap")
         
         chunks = []
-        total_pages = 200
-        step = pages_per_chunk - overlap_pages
-        
+        step = process_pages_per_request - process_overlap_pages
         start_page = 1
         chunk_position = 0
+        consecutive_failures = 0
+        max_consecutive_failures = 3
         
         while start_page <= total_pages:
-            end_page = min(start_page + pages_per_chunk - 1, total_pages)
+            end_page = min(start_page + process_pages_per_request - 1, total_pages)
             
             extraction_prompt = f"""
-                Trích xuất VĂN BẢN từ trang {start_page} đến trang {end_page} của PDF.
+                Trích xuất TOÀN BỘ nội dung từ trang {start_page} đến trang {end_page}.
 
                 YÊU CẦU:
-                1. Trích xuất TOÀN BỘ nội dung từ các trang này
-                2. GIỮ NGUYÊN:
-                - Tiêu đề vị thuốc (IN HOA + chữ Hán)
-                - Các phần A, B, C, D, E
-                - Tên khoa học, công thức hóa học
-                - Đơn thuốc và liều dùng
-                3. LOẠI BỎ: Header, footer, số trang, watermark
-                4. Nếu vị thuốc bị cắt giữa chừng -> giữ nguyên, đừng bỏ
+                1. Giữ nguyên CẤU TRÚC và ĐỊNH DẠNG gốc
+                2. KHÔNG bỏ qua nội dung nào, kể cả nội dung bị cắt giữa chừng
+                3. Loại bỏ: header, footer, số trang, watermark
+                4. Sửa lỗi chính tả OCR rõ ràng
 
-                Bắt đầu trích xuất trang {start_page}-{end_page}:
+                Trang {start_page}-{end_page}:
             """
             
-            max_retries = 3
-            for retry in range(max_retries):
+            for retry in range(self.settings.MAX_RETRIES):
                 try:
                     response = self.gemini_client.models.generate_content(
-                        model=self.config.MODEL_NAME,
+                        model=self.settings.MODEL_NAME,
                         contents=[uploaded_file, extraction_prompt],
-                        config=types.GenerateContentConfig(temperature=0.0)
+                        config=types.GenerateContentConfig(
+                            temperature=0.0,
+                            max_output_tokens=self.settings.MAX_OUTPUT_TOKENS
+                        )
                     )
                     
                     text = response.text.strip()
+                    
                     if len(text) > 100:
                         chunks.append({
                             'text': text,
                             'start_page': start_page,
                             'end_page': end_page,
-                            'position': chunk_position
+                            'position': chunk_position,
+                            'hash': self._calculate_content_hash(text)
                         })
-                        self.logger.info(f"Extracted pages {start_page}-{end_page}: {len(text)} chars")
+                        self.logger.info(f"Pages {start_page}-{end_page}: {len(text)} chars")
                         chunk_position += 1
+                        consecutive_failures = 0
                     else:
-                        self.logger.warning(f"Pages {start_page}-{end_page}: too short, skipping")
+                        self.logger.warning(f"Pages {start_page}-{end_page}: too short ({len(text)} chars)")
                     
-                    time.sleep(10)
+                    # Dynamic delay based on success
+                    time.sleep(self.settings.DELAY_BETWEEN_REQUESTS)
                     break
                     
                 except Exception as e:
                     error_str = str(e)
+                    
                     if '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
-                        wait_time = 60 * (retry + 1)
-                        self.logger.warning(f"Rate limit hit, waiting {wait_time}s before retry {retry+1}/{max_retries}")
-                        time.sleep(wait_time)
+                        # Exponential backoff with jitter
+                        wait_time = min(
+                            self.settings.INITIAL_BACKOFF * (self.settings.BACKOFF_MULTIPLIER ** retry),
+                            self.settings.MAX_BACKOFF
+                        )
+                        jitter = wait_time * 0.1 * (0.5 - random.random())
+                        total_wait = wait_time + jitter
+                        
+                        self.logger.warning(f"Rate limit hit, waiting {total_wait:.1f}s "
+                                          f"(retry {retry+1}/{self.settings.MAX_RETRIES})")
+                        time.sleep(total_wait)
                     else:
-                        self.logger.error(f"Error extracting pages {start_page}-{end_page}: {e}")
+                        self.logger.error(f"Error pages {start_page}-{end_page}: {e}")
+                        consecutive_failures += 1
+                        
+                        if consecutive_failures >= max_consecutive_failures:
+                            self.logger.error(f"Too many consecutive failures, stopping chunk extraction")
+                            return chunks
                         break
             
             start_page += step
         
-        self.logger.info(f"Created {len(chunks)} overlapping chunks")
+        self.logger.info(f"Created {len(chunks)} chunks from {total_pages} pages")
         return chunks
 
-    def _call_gemini_with_retry(self, prompt: str) -> Optional[Dict[str, Any]]:
-        for attempt in range(self.config.MAX_RETRIES):
+    def _call_gemini_with_retry(self, prompt: str, chunk_info: Dict[str, Any] = None) -> Optional[Dict[str, Any]]:
+        last_exception = None
+        
+        for attempt in range(self.settings.MAX_RETRIES):
             try:
-                self.logger.info(f"API call attempt {attempt + 1}/{self.config.MAX_RETRIES}")
+                self.logger.info(f"API call {attempt + 1}/{self.settings.MAX_RETRIES}")
                 
                 response = self.gemini_client.models.generate_content(
-                    model=self.config.MODEL_NAME,
+                    model=self.settings.MODEL_NAME,
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         temperature=0.1,
                         response_mime_type="application/json",
-                        max_output_tokens=self.config.MAX_OUTPUT_TOKENS
+                        max_output_tokens=self.settings.MAX_OUTPUT_TOKENS
                     )
                 )
                 
+                # Parse and validate
                 result = json.loads(response.text)
                 result = validate_json_structure(result)
                 
-                self.logger.info(f"Success: {len(result['vi_thuoc'])} herbs extracted")
-                time.sleep(self.config.DELAY_BETWEEN_REQUESTS)
+                # Log success
+                herbs_count = len(result.get('vi_thuoc', []))
+                prescriptions_count = len(result.get('bai_thuoc', []))
+                formulas_count = len(result.get('cong_thuc', []))
                 
+                self.logger.info(f"Extracted: {herbs_count} herbs, "
+                               f"{prescriptions_count} prescriptions, "
+                               f"{formulas_count} formulas")
+                
+                # Add metadata if provided
+                if chunk_info:
+                    result['_metadata'] = {
+                        'start_page': chunk_info.get('start_page'),
+                        'end_page': chunk_info.get('end_page'),
+                        'position': chunk_info.get('position')
+                    }
+                
+                time.sleep(self.settings.DELAY_BETWEEN_REQUESTS)
                 return result
                 
             except json.JSONDecodeError as e:
                 self.logger.error(f"JSON parse error: {e}")
                 if hasattr(response, 'text'):
-                    self.logger.debug(f"Response preview: {response.text[:200]}...")
+                    self.logger.debug(f"Response preview: {response.text[:300]}...")
+                last_exception = e
                 
             except Exception as e:
                 error_str = str(e)
-                if '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
-                    wait_time = 60 * (attempt + 1)
-                    self.logger.warning(f"Rate limit hit, waiting {wait_time}s...")
-                    time.sleep(wait_time)
-                else:
-                    self.logger.error(f"Error: {str(e)}")
+                last_exception = e
                 
-            if attempt < self.config.MAX_RETRIES - 1:
-                wait_time = (2 ** attempt) * self.config.INITIAL_BACKOFF
-                self.logger.info(f"Retrying in {wait_time}s...")
-                time.sleep(wait_time)
-            else:
-                self.logger.error(f"Failed after {self.config.MAX_RETRIES} attempts")
+                if '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
+                    wait_time = min(
+                        self.settings.INITIAL_BACKOFF * (self.settings.BACKOFF_MULTIPLIER ** attempt),
+                        self.settings.MAX_BACKOFF
+                    )
+                    jitter = wait_time * 0.1 * (0.5 - random.random())
+                    total_wait = wait_time + jitter
+                    
+                    self.logger.warning(f"Rate limit, waiting {total_wait:.1f}s...")
+                    time.sleep(total_wait)
+                else:
+                    self.logger.error(f"API error: {str(e)}")
+                    if attempt < self.settings.MAX_RETRIES - 1:
+                        wait_time = self.settings.INITIAL_BACKOFF * (2 ** attempt)
+                        self.logger.info(f"Retrying in {wait_time}s...")
+                        time.sleep(wait_time)
         
+        self.logger.error(f"Failed after {self.settings.MAX_RETRIES} attempts")
         return None
 
     def _deduplicate_results(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        self.logger.info("Deduplicating results...")
+        self.logger.info("Deduplicating results with similarity matching...")
         
-        seen_herbs = set()
         unique_herbs = []
-        for herb in data['vi_thuoc']:
-            name = herb.get('ten_viet_nam', '').strip().lower()
-            if name and name not in seen_herbs:
-                seen_herbs.add(name)
-                unique_herbs.append(herb)
-            elif name in seen_herbs:
-                self.logger.debug(f"Duplicate herb removed: {name}")
+        duplicate_count = 0
         
-        seen_prescriptions = set()
+        for herb in data['vi_thuoc']:
+            if not self._is_duplicate(herb, unique_herbs):
+                unique_herbs.append(herb)
+            else:
+                duplicate_count += 1
+                # Try to merge information
+                for i, existing in enumerate(unique_herbs):
+                    if self._calculate_similarity(
+                        herb.get('ten_viet_nam', ''),
+                        existing.get('ten_viet_nam', '')
+                    ) >= self.settings.SIMILARITY_THRESHOLD:
+                        unique_herbs[i] = self._merge_duplicate_herbs(existing, herb)
+                        self.logger.debug(f"Merged duplicate: {herb.get('ten_viet_nam')}")
+                        break
+        
+        self.logger.info(f"Removed {duplicate_count} duplicates, kept {len(unique_herbs)} unique herbs")
+        
+        # Deduplicate prescriptions
+        seen_prescriptions = {}
         unique_prescriptions = []
+        
         for prescription in data['bai_thuoc']:
             name = prescription.get('ten_bai_thuoc', '').strip().lower()
             if name and name not in seen_prescriptions:
-                seen_prescriptions.add(name)
+                seen_prescriptions[name] = True
                 unique_prescriptions.append(prescription)
+        
+        # Deduplicate formulas based on combination of prescription + herb + amount
+        seen_formulas = set()
+        unique_formulas = []
+        
+        for formula in data['cong_thuc']:
+            key = (
+                formula.get('ten_bai_thuoc', '').strip().lower(),
+                formula.get('ten_vi_thuoc', '').strip().lower(),
+                formula.get('lieu_luong', '').strip()
+            )
+            if key not in seen_formulas and key[0] and key[1]:
+                seen_formulas.add(key)
+                unique_formulas.append(formula)
         
         return {
             'vi_thuoc': unique_herbs,
             'bai_thuoc': unique_prescriptions,
-            'cong_thuc': data['cong_thuc']
+            'cong_thuc': unique_formulas
         }
 
     def _save_to_files(self, data: Dict[str, Any]):
         self.logger.info("Saving results")
         
         try:
-            os.makedirs(os.path.dirname(self.config.OUTPUT_JSON), exist_ok=True)
+            os.makedirs(os.path.dirname(self.settings.OUTPUT_JSON), exist_ok=True)
             
-            self.logger.info(f"Saving to {safe_path(self.config.OUTPUT_JSON)}...")
-            with open(self.config.OUTPUT_JSON, 'w', encoding='utf-8') as f:
+            self.logger.info(f"Saving to {safe_path(self.settings.OUTPUT_JSON)}...")
+            with open(self.settings.OUTPUT_JSON, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             
             if data['vi_thuoc']:
                 df = pd.DataFrame(data['vi_thuoc'])
                 df.insert(0, 'id', range(1, len(df) + 1))
                 df.to_csv(
-                    self.config.OUTPUT_CSV_VI_THUOC,
+                    self.settings.OUTPUT_CSV_VI_THUOC,
                     index=False,
                     encoding='utf-8-sig',
                     quoting=1,
@@ -271,7 +448,7 @@ class DataExtractor:
                 df = pd.DataFrame(data['bai_thuoc'])
                 df.insert(0, 'id', range(1, len(df) + 1))
                 df.to_csv(
-                    self.config.OUTPUT_CSV_BAI_THUOC,
+                    self.settings.OUTPUT_CSV_BAI_THUOC,
                     index=False,
                     encoding='utf-8-sig',
                     quoting=1,
@@ -282,7 +459,7 @@ class DataExtractor:
                 df = pd.DataFrame(data['cong_thuc'])
                 df.insert(0, 'id', range(1, len(df) + 1))
                 df.to_csv(
-                    self.config.OUTPUT_CSV_CONG_THUC,
+                    self.settings.OUTPUT_CSV_CONG_THUC,
                     index=False,
                     encoding='utf-8-sig',
                     quoting=1,
@@ -295,60 +472,104 @@ class DataExtractor:
 
     def process_pdf_file(self, pdf_path: str) -> Dict[str, Any]:
         self.logger.info(f"Processing: {safe_path(pdf_path)}")
-        self.logger.info(f"Model: {self.config.MODEL_NAME}")
-        self.logger.info(f"Rate limit: {self.config.REQUESTS_PER_MINUTE} RPM")
+        self.logger.info(f"Model: {self.settings.MODEL_NAME}")
+        self.logger.info(f"Rate limit: {self.settings.REQUESTS_PER_MINUTE} RPM")
         
         pdf_path_obj = Path(pdf_path)
         if not pdf_path_obj.exists():
-            self.logger.error(f"File not found: {pdf_path}")
             raise FileNotFoundError(f"PDF file not found: {pdf_path}")
         
-        try:
-            uploaded_file = self._upload_and_wait(pdf_path)
-            chunks = self._chunk_pdf_pages(uploaded_file, pages_per_chunk=6, overlap_pages=2)
-            
-            all_results = {
-                'vi_thuoc': [],
-                'bai_thuoc': [],
-                'cong_thuc': []
-            }
-            
-            self.successful_chunks = 0
-            self.failed_chunks = 0
-            
-            for chunk_info in chunks:
-                self.logger.info(f"Processing chunk {chunk_info['position'] + 1}/{len(chunks)}")
-                self.logger.info(f"Pages {chunk_info['start_page']}-{chunk_info['end_page']}: {len(chunk_info['text'])} chars")
-                
-                prompt = EXTRACTION_PROMPT.format(text=chunk_info['text'])
-                result = self._call_gemini_with_retry(prompt)
-                
-                if result:
-                    all_results['vi_thuoc'].extend(result.get('vi_thuoc', []))
-                    all_results['bai_thuoc'].extend(result.get('bai_thuoc', []))
-                    all_results['cong_thuc'].extend(result.get('cong_thuc', []))
-                    self.successful_chunks += 1
-                else:
-                    self.failed_chunks += 1
-                    self.logger.warning("Chunk failed, skipping...")
+        # Split large PDF into chunks
+        splitted_pdf_paths = self._split_pdf_file(
+            input_path=pdf_path_obj,
+            output_dir=self.settings.RAW_DATA_PATH,
+            pages_per_chunk=self.settings.PAGES_PER_CHUNK,
+            overlap_pages=self.settings.OVERLAP_PAGES
+        )
+        
+        # Initialize results OUTSIDE the loop
+        all_results = {
+            'vi_thuoc': [],
+            'bai_thuoc': [],
+            'cong_thuc': []
+        }
+        
+        total_successful_chunks = 0
+        total_failed_chunks = 0
+        
+        # Process each PDF chunk
+        for chunk_idx, pdf_chunk_path in enumerate(splitted_pdf_paths):
+            self.logger.info(f"Processing chunk {chunk_idx + 1}/{len(splitted_pdf_paths)}: {safe_path(pdf_chunk_path)}")
             
             try:
-                self.gemini_client.files.delete(name=uploaded_file.name)
-                self.logger.info(f"Cleaned up: {uploaded_file.name}")
+                pdf_reader = PdfReader(pdf_chunk_path)
+                total_pages = len(pdf_reader.pages)
+                
+                # Upload to Gemini
+                uploaded_file = self._upload_and_wait(pdf_chunk_path)
+                
+                # Extract text chunks with overlap
+                text_chunks = self._chunk_pdf_pages(
+                    uploaded_file=uploaded_file,
+                    total_pages=total_pages,
+                    process_pages_per_request=self.settings.PROCESS_PAGES_PER_REQUEST,
+                    process_overlap_pages=self.settings.PROCESS_OVERLAP_PAGES,
+                )
+                
+                # Process each text chunk
+                chunk_successful = 0
+                chunk_failed = 0
+                
+                for chunk_info in text_chunks:
+                    self.logger.info(f"\nProcessing text chunk {chunk_info['position'] + 1}/{len(text_chunks)}")
+                    self.logger.info(f"Pages {chunk_info['start_page']}-{chunk_info['end_page']}: "
+                                   f"{len(chunk_info['text'])} chars")
+                    
+                    prompt = EXTRACTION_PROMPT.format(text=chunk_info['text'])
+                    result = self._call_gemini_with_retry(prompt, chunk_info)
+                    
+                    if result:
+                        all_results['vi_thuoc'].extend(result.get('vi_thuoc', []))
+                        all_results['bai_thuoc'].extend(result.get('bai_thuoc', []))
+                        all_results['cong_thuc'].extend(result.get('cong_thuc', []))
+                        chunk_successful += 1
+                    else:
+                        chunk_failed += 1
+                        self.logger.warning("Text chunk failed, continuing...")
+                
+                total_successful_chunks += chunk_successful
+                total_failed_chunks += chunk_failed
+                
+                self.logger.info(f"\nChunk summary: {chunk_successful} successful, {chunk_failed} failed")
+                
+                # Cleanup uploaded file
+                try:
+                    self.gemini_client.files.delete(name=uploaded_file.name)
+                    self.logger.info(f"Cleaned up: {uploaded_file.name}")
+                except Exception as e:
+                    self.logger.warning(f"Cleanup warning: {e}")
+                
             except Exception as e:
-                self.logger.warning(f"Cleanup warning: {e}")
-            
-            all_results = self._deduplicate_results(all_results)
-            self._save_to_files(all_results)
-            
-            self.logger.info(f"Successful chunks: {self.successful_chunks}/{len(chunks)}")
-            self.logger.info(f"Failed chunks: {self.failed_chunks}/{len(chunks)}")
-            self.logger.info(f"Total herbs: {len(all_results['vi_thuoc'])}")
-            self.logger.info(f"Total prescriptions: {len(all_results['bai_thuoc'])}")
-            self.logger.info(f"Total formulas: {len(all_results['cong_thuc'])}")
-            
-            return all_results
-            
-        except Exception as e:
-            self.logger.error(f"Fatal error: {e}")
-            raise
+                self.logger.error(f"Error processing chunk {chunk_idx + 1}: {e}")
+                total_failed_chunks += 1
+                continue
+        
+        # Deduplicate and save
+        self.logger.info("Post-processing results...")
+        
+        self.logger.info(f"Before deduplication: "
+                        f"{len(all_results['vi_thuoc'])} herbs, "
+                        f"{len(all_results['bai_thuoc'])} prescriptions, "
+                        f"{len(all_results['cong_thuc'])} formulas")
+        
+        all_results = self._deduplicate_results(all_results)
+        self._save_to_files(all_results)
+        
+        # Summary
+        self.logger.info(f"Successful chunks: {total_successful_chunks}")
+        self.logger.info(f"Failed chunks: {total_failed_chunks}")
+        self.logger.info(f"Total herbs: {len(all_results['vi_thuoc'])}")
+        self.logger.info(f"Total prescriptions: {len(all_results['bai_thuoc'])}")
+        self.logger.info(f"Total formulas: {len(all_results['cong_thuc'])}")
+        
+        return all_results
