@@ -324,15 +324,6 @@ class DataExtractor:
                     )
                 )
                 # Parse and validate
-                print("="*80)
-                print("DEBUG")
-                print("="*80)
-
-                print("="*80)
-                print("RESPONSE TEXT")
-                print(response.text)
-                print("="*80)
-
                 result = json.loads(response.text)
                 result = validate_json_structure(result)
                 
@@ -538,7 +529,7 @@ class DataExtractor:
                 chunk_failed = 0
                 
                 for chunk_info in text_chunks:
-                    self.logger.info(f"\nProcessing text chunk {chunk_info['position'] + 1}/{len(text_chunks)}")
+                    self.logger.info(f"Processing text chunk {chunk_info['position'] + 1}/{len(text_chunks)}")
                     self.logger.info(f"Pages {chunk_info['start_page']}-{chunk_info['end_page']}: "
                                    f"{len(chunk_info['text'])} chars")
                     
@@ -557,7 +548,7 @@ class DataExtractor:
                 total_successful_chunks += chunk_successful
                 total_failed_chunks += chunk_failed
                 
-                self.logger.info(f"\nChunk summary: {chunk_successful} successful, {chunk_failed} failed")
+                self.logger.info(f"Chunk summary: {chunk_successful} successful, {chunk_failed} failed")
                 
                 # Cleanup uploaded file
                 try:
