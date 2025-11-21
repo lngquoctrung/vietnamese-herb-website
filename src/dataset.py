@@ -490,7 +490,7 @@ class DataExtractor:
         # Split large PDF into chunks
         splitted_pdf_paths = self._split_pdf_file(
             input_path=pdf_path_obj,
-            output_dir=self.settings.RAW_DATA_PATH,
+            output_dir=f"{self.settings.RAW_DATA_PATH}/chunks",
             pages_per_chunk=self.settings.PAGES_PER_CHUNK,
             overlap_pages=self.settings.OVERLAP_PAGES
         )
