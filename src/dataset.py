@@ -211,10 +211,53 @@ class DataExtractor:
                     merged[key] = value
         
         return merged
+    
+    def _extract_with_model(self, uploaded_file: Any, prompt: str, 
+                       model_name: str, start_page: int, end_page: int) -> Optional[str]:
+        """Extract text using specified model with retry logic"""
+        
+        for retry in range(self.settings.MAX_RETRIES):
+            try:
+                response = self.gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=[uploaded_file, prompt],
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        max_output_tokens=self.settings.MAX_OUTPUT_TOKENS
+                    )
+                )
+                
+                text = response.text.strip()
+                
+                # Add delay
+                time.sleep(self.settings.DELAY_BETWEEN_REQUESTS)
+                return text
+                
+            except Exception as e:
+                error_str = str(e)
+                
+                if '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
+                    wait_time = min(
+                        self.settings.INITIAL_BACKOFF * (self.settings.BACKOFF_MULTIPLIER ** retry),
+                        self.settings.MAX_BACKOFF
+                    )
+                    jitter = wait_time * 0.1 * (0.5 - random.random())
+                    total_wait = wait_time + jitter
+                    
+                    self.logger.warning(
+                        f"Rate limit hit on {model_name}, waiting {total_wait:.1f}s "
+                        f"(retry {retry+1}/{self.settings.MAX_RETRIES})"
+                    )
+                    time.sleep(total_wait)
+                else:
+                    self.logger.error(f"Error with {model_name} on pages {start_page}-{end_page}: {e}")
+                    break
+        
+        return None
 
-    def _chunk_pdf_pages(self, uploaded_file: Any, total_pages: int, 
-                        process_pages_per_request: int = 8, 
-                        process_overlap_pages: int = 3) -> List[Dict[str, Any]]:
+    def _chunk_pdf_pages(self, uploaded_file: Any, total_pages: int,
+                     process_pages_per_request: int = 8,
+                     process_overlap_pages: int = 3) -> List[Dict[str, Any]]:
         self.logger.info(f"Processing PDF: {total_pages} pages, "
                         f"{process_pages_per_request} pages/chunk, "
                         f"{process_overlap_pages} overlap")
@@ -231,91 +274,88 @@ class DataExtractor:
             
             extraction_prompt = f"""EXTRACT TEXT từ trang {start_page}-{end_page}.
 
-                PDF FORMAT: 2 columns (IEEE style) with Vietnamese medicine content
+                    PDF FORMAT: 2 columns (IEEE style) with Vietnamese medicine content
 
-                CRITICAL: Extract COMPLETE content, DON'T summarize or skip
+                    CRITICAL: Extract COMPLETE content, DON'T summarize or skip
 
-                READING ORDER:
-                1. Read LEFT column from top to bottom
-                2. Then read RIGHT column from top to bottom
+                    READING ORDER:
+                    1. Read LEFT column from top to bottom
+                    2. Then read RIGHT column from top to bottom
 
-                KEEP (preserve exactly):
-                - Medicine names in CAPITAL LETTERS + Chinese characters (蛇床子, 馬鞭草...)
-                - Scientific names in Latin (Cnidium monnieri, Verbena officinalis...)
-                - Chemical formulas (C₁₅H₁₆O₃, OCH₃, CO...)
-                - Chemical structure names (Ostola, Dictamin, Wedelolacton...)
-                - Sections A, B, C, D, E
-                - Dosage numbers (4-12g, 0.5g...)
-                - All prescriptions and recipes
+                    KEEP (preserve exactly):
+                    - Medicine names in CAPITAL LETTERS + Chinese characters (蛇床子, 馬鞭草...)
+                    - Scientific names in Latin (Cnidium monnieri, Verbena officinalis...)
+                    - Chemical formulas (C₁₅H₁₆O₃, OCH₃, CO...)
+                    - Chemical structure names (Ostola, Dictamin, Wedelolacton...)
+                    - Sections A, B, C, D, E
+                    - Dosage numbers (4-12g, 0.5g...)
+                    - All prescriptions and recipes
 
-                REMOVE:
-                - Watermark: "https://trungtamthuoc.com/"
-                - Page numbers
-                - Standalone image captions (like "Hình 41", "Hình 42")
+                    REMOVE:
+                    - Watermark: "https://trungtamthuoc.com/"
+                    - Page numbers
+                    - Standalone image captions (like "Hình 41", "Hình 42")
 
-                If medicine entry is CUT mid-page → KEEP IT (will be handled with overlap)
+                    If medicine entry is CUT mid-page → KEEP IT (will be handled with overlap)
 
-                NEVER repeat the same sentence more than once
+                    NEVER repeat the same sentence more than once
 
-                OUTPUT: Plain text, no markdown, no summary.
+                    OUTPUT: Plain text, no markdown, no summary.
 
-                Begin extraction:
-            """
+                    Begin extraction:
+                """
             
-            for retry in range(self.settings.MAX_RETRIES):
-                try:
-                    response = self.gemini_client.models.generate_content(
-                        model=self.settings.OCR_MODEL_NAME,
-                        contents=[uploaded_file, extraction_prompt],
-                        config=types.GenerateContentConfig(
-                            temperature=0.0,
-                            max_output_tokens=self.settings.MAX_OUTPUT_TOKENS
-                        )
-                    )
-                    
-                    text = response.text.strip()
-                    
-                    if len(text) > 100:
-                        chunks.append({
-                            'text': text,
-                            'start_page': start_page,
-                            'end_page': end_page,
-                            'position': chunk_position,
-                            'hash': self._calculate_content_hash(text)
-                        })
-                        self.logger.info(f"Pages {start_page}-{end_page}: {len(text)} chars")
-                        chunk_position += 1
-                        consecutive_failures = 0
-                    else:
-                        self.logger.warning(f"Pages {start_page}-{end_page}: too short ({len(text)} chars)")
-                    
-                    # Dynamic delay based on success
-                    time.sleep(self.settings.DELAY_BETWEEN_REQUESTS)
-                    break
-                    
-                except Exception as e:
-                    error_str = str(e)
-                    
-                    if '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
-                        # Exponential backoff with jitter
-                        wait_time = min(
-                            self.settings.INITIAL_BACKOFF * (self.settings.BACKOFF_MULTIPLIER ** retry),
-                            self.settings.MAX_BACKOFF
-                        )
-                        jitter = wait_time * 0.1 * (0.5 - random.random())
-                        total_wait = wait_time + jitter
-                        
-                        self.logger.warning(f"Rate limit hit, waiting {total_wait:.1f}s "
-                                          f"(retry {retry+1}/{self.settings.MAX_RETRIES})")
-                        time.sleep(total_wait)
-                    else:
-                        self.logger.error(f"Error pages {start_page}-{end_page}: {e}")
-                        consecutive_failures += 1
-                        
-                        if consecutive_failures >= max_consecutive_failures:
-                            self.logger.error(f"Too many consecutive failures, stopping chunk extraction")
-                            return chunks
-                        break
+            # Try with primary model first
+            text = self._extract_with_model(
+                uploaded_file, 
+                extraction_prompt,
+                self.settings.OCR_MODEL_NAME,
+                start_page,
+                end_page
+            )
+            
+            # If result too short and fallback enabled, retry with fallback model
+            if (text and len(text) < self.settings.MIN_OCR_LENGTH and 
+                self.settings.RETRY_WITH_FALLBACK):
+                
+                self.logger.warning(
+                    f"Pages {start_page}-{end_page}: too short ({len(text)} chars), "
+                    f"retrying with {self.settings.OCR_FALLBACK_MODEL}"
+                )
+                
+                fallback_text = self._extract_with_model(
+                    uploaded_file,
+                    extraction_prompt,
+                    self.settings.OCR_FALLBACK_MODEL,
+                    start_page,
+                    end_page
+                )
+                
+                # Use fallback if it's better
+                if fallback_text and len(fallback_text) > len(text):
+                    text = fallback_text
+                    self.logger.info(f"Fallback successful: {len(text)} chars")
+                else:
+                    self.logger.warning("Fallback didn't improve result")
+            
+            # Add to chunks if valid
+            if text and len(text) >= self.settings.MIN_OCR_LENGTH:
+                chunks.append({
+                    'text': text,
+                    'start_page': start_page,
+                    'end_page': end_page,
+                    'position': chunk_position,
+                    'hash': self._calculate_content_hash(text)
+                })
+                self.logger.info(f"Pages {start_page}-{end_page}: {len(text)} chars")
+                chunk_position += 1
+                consecutive_failures = 0
+            else:
+                self.logger.error(f"Pages {start_page}-{end_page}: extraction failed")
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    self.logger.error("Too many consecutive failures, stopping")
+                    return chunks
             
             start_page += step
         

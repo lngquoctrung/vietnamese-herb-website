@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     # Model config
     GEMINI_API_KEY: str
     OCR_MODEL_NAME: str = "gemini-2.0-flash"
+    OCR_FALLBACK_MODEL: str = "gemini-2.0-flash-lite"
     TEXT_MODEL_NAME: str = "gemini-2.5-flash-lite"
     MAX_OUTPUT_TOKENS: int = 8192
 
@@ -35,6 +36,8 @@ class Settings(BaseSettings):
     INITIAL_BACKOFF: int = 3
     BACKOFF_MULTIPLIER: float = 1.5
     MAX_BACKOFF: int = 120
+    MIN_OCR_LENGTH: int = 100
+    RETRY_WITH_FALLBACK: bool = True
 
     # Deduplication config
     SIMILARITY_THRESHOLD: float = 0.85
