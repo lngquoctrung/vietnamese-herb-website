@@ -18,26 +18,26 @@ class Settings(BaseSettings):
 
     # Processing config
     PAGES_PER_CHUNK: int = 200
-    OVERLAP_PAGES: int = 15
+    OVERLAP_PAGES: int = 10
     PROCESS_PAGES_PER_REQUEST: int = 6
     PROCESS_OVERLAP_PAGES: int = 3
 
     # Model config
     GEMINI_API_KEY: str
-    OCR_MODEL_NAME: str = "gemini-2.0-flash"
-    OCR_FALLBACK_MODEL: str = "gemini-2.0-flash-lite"
+    OCR_MODEL_NAME: str = "gemini-2.0-flash-lite"
+    OCR_FALLBACK_MODEL: str = "gemini-2.0-flash"
     TEXT_MODEL_NAME: str = "gemini-2.5-flash-lite"
 
     # Request limitation
     REQUESTS_PER_MINUTE: int = 8
-    DELAY_BETWEEN_REQUESTS: float = 8.0
+    DELAY_BETWEEN_REQUESTS: float = 10.0
     MAX_RETRIES: int = 5
     INITIAL_BACKOFF: int = 10.0
     BACKOFF_MULTIPLIER: float = 2.0
     MAX_BACKOFF: int = 120
 
     # OCR config
-    MIN_OCR_LENGTH: int = 100
+    MIN_OCR_LENGTH: int = 1000
     RETRY_WITH_FALLBACK: bool = True
     MAX_OUTPUT_TOKENS: int = 8192
 

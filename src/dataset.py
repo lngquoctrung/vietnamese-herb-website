@@ -19,33 +19,65 @@ from .utils import get_logger, safe_path, validate_json_structure
 EXTRACTION_PROMPT = """
 Bạn là chuyên gia phân tích tài liệu Y học Cổ truyền Việt Nam.
 
-VĂN BẢN: OCR từ PDF scan về thuốc Đông y.
+NHIỆM VỤ: Trích xuất thông tin có cấu trúc từ văn bản OCR về thuốc Đông y.
 
-CẤU TRÚC VỊ THUỐC:
-- TIÊU ĐỀ: TÊN VỊ THUỐC (IN HOA) + chữ Hán
-- Còn gọi là: tên khác
-- Tên khoa học: Latin
-- Thuộc họ: họ thực vật
-- Mô tả cây
-- Phân bố, thu hái, chế biến
-- Thành phần hóa học
-- Tác dụng dược lý
-- Công dụng và liều dùng
+CẤU TRÚC THÔNG TIN VỊ THUỐC:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+THÔNG TIN BẮT BUỘC (phải có):
+- Tên vị thuốc (IN HOA) + chữ Hán (nếu có)
+- Ít nhất MỘT trong các thông tin: mô tả, thành phần, công dụng
 
-QUY TẮC:
-1. Văn bản BẮT ĐẦU giữa chừng (không có tiêu đề) -> BỎ QUA
-2. Văn bản KẾT THÚC giữa chừng (thiếu các thông như như thành phần hóa học hay công dụng và liều dùng) -> BỎ QUA
-3. Nếu một phần KHÔNG CÓ THÔNG TIN -> ghi rõ: "Không có thông tin"
-4. KHÔNG được để trống hay null
-5. Sửa lỗi chính tả OCR
-6. TUYỆT ĐỐI KHÔNG lặp lại một câu hoặc một đoạn văn quá 2 lần. Nếu văn bản gốc bị lỗi lặp, hãy chỉ lấy thông tin một lần duy nhất.
-7. SAU KHI HOÀN THÀNH JSON, PHẢI GHI ###END### để đánh dấu kết thúc
+THÔNG TIN TÙY CHỌN (có thể có hoặc không):
+- Còn gọi là / Tên khác
+- Tên khoa học (Latin)
+- Thuộc họ
+- A. Mô tả cây
+- B. Phân bố, thu hái, chế biến
+- C. Thành phần hóa học
+- D. Tác dụng dược lý
+- E. Công dụng và liều dùng
+- Tính vị
+- Quy kinh
+- Liều dùng
+- Chống chỉ định
+
+LƯU Ý: KHÔNG PHẢI MỌI VỊ THUỐC ĐỀU CÓ ĐẦY ĐỦ CÁC PHẦN TRÊN!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+QUY TẮC TRÍCH XUẤT:
+
+1. ĐIỀU KIỆN HỢP LỆ (linh hoạt hơn)
+   ✓ Có tên vị thuốc rõ ràng (IN HOA hoặc có chữ Hán)
+   ✓ Có ít nhất một thông tin hữu ích (mô tả/thành phần/công dụng)
+   ✗ Văn bản BẮT ĐẦU giữa chừng KHÔNG rõ tên thuốc → BỎ QUA
+   ✗ Chỉ là tên thuốc mà không có thông tin gì → BỎ QUA
+
+2. XỬ LÝ THÔNG TIN THIẾU
+   - Nếu phần nào KHÔNG CÓ → ghi "Không có thông tin"
+   - KHÔNG để trống hay null
+   - KHÔNG bỏ qua vị thuốc chỉ vì thiếu vài phần
+
+3. XỬ LÝ HÌNH CẤU TRÚC PHÂN TỬ
+   - Trong OCR sẽ thấy: "[Hình cấu trúc phân tử]"
+   - KHÔNG cố gắng mô tả hay interpret hình
+   - Chỉ ghi vào "thanh_phan_hoa_hoc": "...có cấu trúc: [Hình cấu trúc phân tử]..."
+   - Tiếp tục extract text sau hình
+
+4. ĐẢM BẢO CHẤT LƯỢNG
+   - Sửa lỗi chính tả OCR nhẹ nhàng
+   - GIỮ NGUYÊN thuật ngữ khoa học, công thức hóa học
+   - TUYỆT ĐỐI KHÔNG lặp lại câu/đoạn văn
+   - Nếu thấy repetition → chỉ lấy 1 lần
+
+5. KẾT THÚC
+   - Sau khi hoàn thành JSON: ###END###
+   - KHÔNG generate thêm sau đó
 
 JSON OUTPUT:
 {
   "vi_thuoc": [{
     "ten_vietnam": "TÊN (IN HOA) + chữ Hán",
-    "ten_goi_khac": "Tên khác phân cách bằng ,",
+    "ten_goi_khac": "Tên khác phân cách bằng",
     "ten_khoa_hoc": "Tên Latin đầy đủ",
     "ho_thuc_vat": "Họ thực vật",
     "mo_ta": "Mô tả chi tiết",
@@ -54,8 +86,8 @@ JSON OUTPUT:
     "tac_dung_duoc_ly": "Tác dụng dược lý",
     "tinh_vi": "Tính vị",
     "quy_kinh": "Kinh lạc",
-    "cong_dung": "Công dụng điều trị",
-    "lieu_dung": "Liều dùng (gram/ngày)",
+    "cong_dung": "Công dụng điều trị hoặc công dụng chung",
+    "lieu_dung": "Liều dùng cụ thể (gram/ngày)",
     "ghi_chu": "Chống chỉ định, độc tính..."
   }],
   "bai_thuoc": [{
@@ -75,7 +107,7 @@ JSON OUTPUT:
 ###END###
 
 CHÚ Ý:
-- JSON hợp lệ, không thêm ```
+- JSON hợp lệ, không thêm ```, không markdown
 - Tên NHẤT QUÁN giữa các bảng
 - Nếu phần nào KHÔNG TỒN TẠI -> ghi "Không có thông tin"
 
@@ -285,38 +317,79 @@ class DataExtractor:
         while start_page <= total_pages:
             end_page = min(start_page + process_pages_per_request - 1, total_pages)
             
-            extraction_prompt = f"""EXTRACT COMPLETE TEXT từ trang {start_page}-{end_page}.
+            extraction_prompt = f"""You are an expert OCR system for Vietnamese Traditional Medicine textbooks.
 
-                PDF FORMAT: 2 columns (IEEE style) with Vietnamese traditional medicine content
+                TASK: Extract COMPLETE text from PDF pages {start_page} to {end_page}.
 
-                CRITICAL RULES:
-                1. Extract COMPLETE content - DO NOT summarize, skip, or paraphrase
-                2. MINIMUM 500-1000 characters per page (unless blank page)
-                3. NEVER repeat the same sentence/phrase more than once
-                4. If you see repetition in source, extract only ONCE
+                PDF CHARACTERISTICS:
+                - Format: 2-column layout (read LEFT column top→bottom, then RIGHT column top→bottom)
+                - Language: Vietnamese with Chinese characters and Latin scientific names
+                - Content: Medicine descriptions with varying structures (NOT all follow A-B-C-D-E format)
+                - Special elements: Chemical formulas, molecular structure diagrams, dosage information
+                - Watermark: "https://trungtamthuoc.com/" (REMOVE this)
 
-                READING ORDER:
-                1. Read LEFT column from top to bottom
-                2. Then read RIGHT column from top to bottom
+                STRICT REQUIREMENTS:
 
-                KEEP (preserve exactly):
-                - Medicine names in CAPITAL LETTERS + Chinese characters (蛇床子, 馬鞭草...)
-                - Scientific names in Latin (Cnidium monnieri, Verbena officinalis...)
-                - Chemical formulas (C₁₅H₁₆O₃, OCH₃, CO...)
-                - Chemical structure names (Ostola, Dictamin, Wedelolacton...)
-                - Dosage numbers (4-12g, 0.5g...)
-                - All prescriptions and detailed descriptions
+                1. COMPLETENESS
+                - Extract EVERY word and number visible in the text
+                - DO NOT summarize, paraphrase, or interpret
+                - Minimum output: 1200 characters per page (unless sparse page)
+                - If output < 1200 chars/page → extract again with MORE detail
 
-                REMOVE:
-                - Watermark: "https://trungtamthuoc.com/"
+                2. PRESERVE EXACTLY
+                - Medicine names: UPPERCASE + Chinese (Example: BẠC HÀ 薄荷, ĐINH HƯƠNG 丁香)
+                - Scientific names: Latin formatting (Example: Mentha arvensis L., Syzygium aromaticum)
+                - Chemical formulas: Exact notation (C₁₀H₁₈O, CH₃, COOH, OCH₃, etc.)
+                - Chemical names: menthol, eugenol, borneol, camphor, carvone, etc.
+                - Dosages: Numbers + units (3-10g, 6-12g, 0.3-0.5ml)
+                - Vietnamese diacritics: Perfect preservation
+
+                3. HANDLE MOLECULAR STRUCTURE DIAGRAMS
+                - These appear as chemical drawings with bonds (benzene rings, carbon chains, etc.)
+                - SKIP trying to OCR the diagram itself
+                - Instead, write: "[Hình cấu trúc phân tử]" where diagram appears
+                - Continue extracting text AFTER the diagram
+                - Example: "...chứa eugenol [Hình cấu trúc phân tử] có tác dụng..."
+
+                4. READING ORDER
+                - Start: Top of LEFT column → Bottom of LEFT column
+                - Then: Top of RIGHT column → Bottom of RIGHT column
+                - Continue to next page
+
+                5. STRUCTURE VARIATIONS TO EXPECT
+                Some medicines follow full structure:
+                - Title, Scientific name, Family
+                - A. Mô tả cây
+                - B. Phân bố, thu hái
+                - C. Thành phần hóa học
+                - D. Tác dụng dược lý
+                - E. Công dụng và liều dùng
+                
+                Others have partial or different structure:
+                - May have only 2-3 sections
+                - May have different section titles
+                - Some are just short descriptions
+                → EXTRACT EVERYTHING regardless of structure completeness
+
+                6. REMOVE/SKIP
                 - Page numbers
-                - Standalone image captions (like "Hình 41", "Hình 42")
+                - Watermark: "https://trungtamthuoc.com/"
+                - Diagram captions like "Hình 45" IF standalone (keep if part of sentence)
+                - The molecular diagrams themselves (replace with "[Hình cấu trúc phân tử]")
 
-                If medicine entry is CUT mid-page → KEEP IT (will be handled with overlap)
+                7. HANDLE INCOMPLETE ENTRIES
+                - If medicine starts mid-page: KEEP IT (overlap handles merging)
+                - If medicine ends mid-page: KEEP IT
+                - DO NOT try to "fix" incomplete entries
 
-                OUTPUT: Plain text only, no markdown, no commentary.
+                QUALITY TARGET (not strict requirement):
+                - Aim for ~1500-2000 chars per page for dense pages
+                - Less is OK for pages with large diagrams or sparse text
+                - More is better - never truncate
 
-                Begin extraction:
+                OUTPUT: Plain text only. No markdown, no interpretation, no translation.
+
+                BEGIN EXTRACTION:
             """
             
             # Try with primary model first
